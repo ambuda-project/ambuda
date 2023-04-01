@@ -32,7 +32,6 @@ from wtforms.widgets import TextArea
 
 from ambuda import database as db
 from ambuda import queries as q
-from ambuda.tasks import app as celery_app
 from ambuda.tasks import ocr as ocr_tasks
 from ambuda.utils import project_utils, proofing_utils
 from ambuda.utils.revisions import add_revision
@@ -40,6 +39,10 @@ from ambuda.views.proofing.decorators import moderator_required, p2_required
 
 bp = Blueprint("project", __name__)
 LOG = logging.getLogger(__name__)
+
+
+def get_celery_app():
+    return current_app.extensions["celery"]
 
 
 def _is_valid_page_number_spec(_, field):
@@ -185,13 +188,11 @@ def activity(slug):
         .limit(100)
         .all()
     )
-    recent_activity = [("revision", r.created, r) for r in recent_revisions]
-    recent_activity.append(("project", project_.created_at, project_))
 
     return render_template(
         "proofing/projects/activity.html",
         project=project_,
-        recent_activity=recent_activity,
+        recent_revisions=recent_revisions,
     )
 
 
@@ -607,10 +608,7 @@ def batch_ocr(slug):
         abort(404)
 
     if request.method == "POST":
-        task = ocr_tasks.run_ocr_for_project(
-            app_env=current_app.config["AMBUDA_ENVIRONMENT"],
-            project=project_,
-        )
+        task = ocr_tasks.run_ocr_for_project(project=project_)
         if task:
             return render_template(
                 "proofing/projects/batch-ocr-post.html",
@@ -632,7 +630,7 @@ def batch_ocr(slug):
 
 @bp.route("/batch-ocr-status/<task_id>")
 def batch_ocr_status(task_id):
-    r = GroupResult.restore(task_id, app=celery_app)
+    r = GroupResult.restore(task_id, app=get_celery_app())
     assert r, task_id
 
     if r.results:

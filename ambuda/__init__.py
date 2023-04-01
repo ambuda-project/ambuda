@@ -13,16 +13,16 @@ from dotenv import load_dotenv
 from flask import Flask, session
 from flask_babel import Babel, pgettext
 from sentry_sdk.integrations.flask import FlaskIntegration
-from sqlalchemy import exc
 
 import config
 from ambuda import admin as admin_manager
 from ambuda import auth as auth_manager
-from ambuda import checks, filters, queries
+from ambuda import checks, filters
 from ambuda.consts import LOCALES
 from ambuda.mail import mailer
+from ambuda.models.base import db
+from ambuda.tasks import celery_init_app
 from ambuda.utils import assets
-from ambuda.utils.json_serde import AmbudaJSONEncoder
 from ambuda.utils.url_converters import ListConverter
 from ambuda.views.about import bp as about
 from ambuda.views.api import bp as api
@@ -42,32 +42,6 @@ def _initialize_sentry(sentry_dsn: str):
     )
 
 
-def _initialize_db_session(app, config_name: str):
-    """Ensure that our SQLAlchemy session behaves well.
-
-    The Flask-SQLAlchemy library manages all of this boilerplate for us
-    automatically, but Flask-SQLAlchemy has relatively poor support for using
-    our models outside of the application context, e.g. when running seed
-    scripts or other batch jobs. So instead of using that extension, we manage
-    the boilerplate ourselves.
-    """
-
-    @app.teardown_appcontext
-    def shutdown_session(exception=None):
-        """Reset session state to prevent caching and memory leaks."""
-        queries.get_session_class().remove()
-
-    if config_name == config.PRODUCTION:
-        # The hook below hides database errors. So, install the hook only if
-        # we're in production.
-
-        @app.errorhandler(exc.SQLAlchemyError)
-        def handle_db_exceptions(error):
-            """Rollback errors so that the db can handle future requests."""
-            session = queries.get_session()
-            session.rollback()
-
-
 def _initialize_logger(log_level: int) -> None:
     """Initialize a simple logger for all requests."""
     handler = logging.StreamHandler(sys.stderr)
@@ -79,7 +53,11 @@ def _initialize_logger(log_level: int) -> None:
 
 
 def create_app(config_env: str):
-    """Initialize the Ambuda application."""
+    """Initialize the Ambuda application.
+
+    :param config_env: the config environment to use. For valid values, see
+        the string constants in `config.py`.
+    """
 
     # We store all env variables in a `.env` file so that it's easier to manage
     # different configurations.
@@ -99,6 +77,12 @@ def create_app(config_env: str):
     # Config
     app.config.from_object(config_spec)
 
+    # Database
+    db.init_app(app)
+
+    # Celery
+    celery_init_app(app)
+
     # Sanity checks
     assert config_env == config_spec.AMBUDA_ENVIRONMENT
     if config_env != config.TESTING:
@@ -108,10 +92,7 @@ def create_app(config_env: str):
     # Logger
     _initialize_logger(config_spec.LOG_LEVEL)
 
-    # Database
-    _initialize_db_session(app, config_env)
-
-    # Extensions
+    # Various Flask extensions
     babel = Babel(app)
 
     @babel.localeselector
@@ -142,12 +123,17 @@ def create_app(config_env: str):
 
     # Debug-only routes for local development.
     if app.debug:
+        from flask_debugtoolbar import DebugToolbarExtension
+
         from ambuda.views.debug import bp as debug_bp
 
+        DebugToolbarExtension(app)
         app.register_blueprint(debug_bp, url_prefix="/debug")
 
     # i18n string trimming
+    # For more, see:https://jinja.palletsprojects.com/en/3.1.x/api/#ext-i18n-trimmed
     app.jinja_env.policies["ext.i18n.trimmed"] = True
+
     # Template functions and filters
     app.jinja_env.filters.update(
         {
@@ -167,5 +153,4 @@ def create_app(config_env: str):
         }
     )
 
-    app.json_encoder = AmbudaJSONEncoder
     return app

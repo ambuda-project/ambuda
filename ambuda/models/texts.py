@@ -11,10 +11,10 @@ from sqlalchemy import Column, Integer, String
 from sqlalchemy import Text as _Text
 from sqlalchemy.orm import relationship
 
-from ambuda.models.base import Base, foreign_key, pk
+from ambuda.models.base import db, foreign_key, pk
 
 
-class Text(Base):
+class Text(db.Model):
 
     """A text with its metadata."""
 
@@ -35,7 +35,7 @@ class Text(Base):
         return self.slug
 
 
-class TextSection(Base):
+class TextSection(db.Model):
 
     """Ordered divisions of text content. This represent divisions like kāṇḍas,
     sargas, etc.
@@ -66,7 +66,7 @@ class TextSection(Base):
     )
 
 
-class TextBlock(Base):
+class TextBlock(db.Model):
     """A verse or paragraph.
 
     A TextBlock is the "unit of reuse." When we make cross-references between
