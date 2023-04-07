@@ -1,5 +1,6 @@
 import logging
 import re
+from dataclasses import dataclass
 
 from celery.result import GroupResult
 from flask import (
@@ -128,20 +129,12 @@ def validate_matches(form, field):
             raise ValidationError("Invalid match form values.")
 
 
-class PreviewChangesForm(ReplaceForm):
+class SaveChangesForm(ReplaceForm):
     class Meta:
         csrf = False
 
     matches = FieldList(FormField(MatchForm), validators=[validate_matches])
-    submit = SubmitField("Preview changes")
-
-
-class ConfirmChangesForm(ReplaceForm):
-    class Meta:
-        csrf = False
-
-    confirm = SubmitField("Confirm")
-    cancel = SubmitField("Cancel")
+    submit = SubmitField("Save selected changes")
 
 
 @bp.route("/<slug>/")
@@ -345,61 +338,90 @@ def search(slug):
     )
 
 
-def _replace_text(project_, replace_form: ReplaceForm, query: str, replace: str):
-    """
-    Gather all matches for the "query" string and pair them the "replace" string.
-    """
+@dataclass
+class Replacement:
+    """Models a replacement of a specific page/line."""
 
+    #: slug of the page that contains this replacement.
+    page_slug: str
+    #: The 0-indexed line number.
+    line_num: int
+    #: Regex splits of a line. Odd indices match the query phrase.
+    splits: list[str]
+    #: The replacement for the odd indices in `splits`.
+    replacement: str
+
+    @property
+    def form_key(self) -> str:
+        return f"match{self.page_slug}-{self.line_num}"
+
+    @property
+    def marked_query(self) -> str:
+        buf = []
+        for i, t in enumerate(self.splits):
+            if i % 2 == 1:
+                buf.append("<mark>")
+                buf.append(escape(t))
+                buf.append("</mark>")
+            else:
+                buf.append(escape(t))
+        return "".join(buf)
+
+    @property
+    def result(self) -> str:
+        buf = []
+        for i, t in enumerate(self.splits):
+            if i % 2 == 1:
+                buf.append(self.replacement)
+            else:
+                buf.append(t)
+        return "".join(buf)
+
+    @property
+    def marked_replace(self) -> str:
+        buf = []
+        for i, t in enumerate(self.splits):
+            if i % 2 == 1:
+                buf.append("<mark>")
+                buf.append(escape(self.replacement))
+                buf.append("</mark>")
+            else:
+                buf.append(escape(t))
+        return "".join(buf)
+
+
+def _find_replacements(project_, query: str, replace: str) -> list[Replacement]:
+    """Find all possible replacements of `query` with `replace` in `project_`."""
+
+    # Use `re.UNICODE` to support unicode search/replace.
+    re_query = re.compile(f"({query})", re.UNICODE)
     results = []
-
-    query_pattern = re.compile(
-        query, re.UNICODE
-    )  # Compile the regex pattern with Unicode support
-
-    LOG.debug(f"Search/Replace text with {query} and {replace}")
     for page_ in project_.pages:
         if not page_.revisions:
             continue
-        matches = []
+
         latest = page_.revisions[-1]
-        LOG.debug(f"{__name__}: {page_.slug}")
         for line_num, line in enumerate(latest.content.splitlines()):
-            if query_pattern.search(line):
-                try:
-                    marked_query = query_pattern.sub(
-                        lambda m: Markup(f"<mark>{escape(m.group(0))}</mark>"), line
-                    )
-                    marked_replace = query_pattern.sub(
-                        Markup(f"<mark>{escape(replace)}</mark>"), line
-                    )
-                    LOG.debug(f"Search/Replace > marked query: {marked_query}")
-                    LOG.debug(f"Search/Replace > marked replace: {marked_replace}")
-                    matches.append(
-                        {
-                            "query": marked_query,
-                            "replace": marked_replace,
-                            "checked": False,
-                            "line_num": line_num,
-                        }
-                    )
-                except TimeoutError:
-                    # Handle the timeout for regex operation, e.g., log a warning or show an error message
-                    LOG.warning(
-                        f"Regex operation timed out for line {line_num}: {line}"
-                    )
+            try:
+                splits = re_query.split(line)
+            except TimeoutError:
+                LOG.warning(f"Regex timed out for line: `{line}`")
+                continue
 
-        if matches:
-            results.append(
-                {
-                    "slug": page_.slug,
-                    "matches": matches,
-                }
-            )
-
+            if len(splits) > 1:
+                # If length is 1, there are no matches.
+                results.append(
+                    Replacement(
+                        page_slug=page_.slug,
+                        line_num=line_num,
+                        splits=splits,
+                        replacement=replace,
+                    )
+                )
     return results
 
 
-@bp.route("/<slug>/replace", methods=["GET", "POST"])
+@bp.route("/<slug>/replace", methods=["GET"])
 @p2_required
 def replace(slug):
     """Search and replace a string across all of the project's pages.
@@ -410,7 +432,7 @@ def replace(slug):
     if project_ is None:
         abort(404)
 
-    form = ReplaceForm(request.form)
+    form = ReplaceForm(request.args)
     if not form.validate():
         invalid_keys = list(form.errors.keys())
         LOG.debug(f"Invalid form - {request.method}, invalid keys: {invalid_keys}")
@@ -418,208 +440,90 @@ def replace(slug):
             "proofing/projects/replace.html", project=project_, form=ReplaceForm()
         )
 
-    # search for "query" string and replace with "update" string
     query = form.query.data
     replace = form.replace.data
-    results = _replace_text(project_, replace_form=form, query=query, replace=replace)
-    num_matches = sum(len(r["matches"]) for r in results)
+    results = _find_replacements(project_, query=query, replace=replace)
 
     return render_template(
         "proofing/projects/replace.html",
         project=project_,
         form=form,
-        submit_changes_form=PreviewChangesForm(),
+        submit_changes_form=SaveChangesForm(),
         query=query,
         replace=replace,
-        num_matches=num_matches,
         results=results,
+        num_matches=len(results),
     )
 
 
-def _select_changes(project_, selected_keys, query: str, replace: str):
-    """
-    Mark "query" strings
-    """
-    results = []
-    LOG.debug(f"{__name__}: Mark changes with {query} and {replace}")
-    query_pattern = re.compile(
-        query, re.UNICODE
-    )  # Compile the regex pattern with Unicode support
+@bp.route("/<slug>/replace", methods=["POST"])
+@p2_required
+def replace_post(slug):
+    project_ = q.project(slug)
+    if project_ is None:
+        abort(404)
+
+    # FIXME(Kishore): find a way to validate this form. Current `matches` are
+    # coming in the way of validators.
+    form = SaveChangesForm(request.form)
+
+    query = form.query.data
+    replace = form.replace.data
+    all_matches = _find_replacements(project_, query=query, replace=replace)
+
+    selected_keys = {
+        key
+        for key, value in request.form.items()
+        if key.startswith("match") and value == "selected"
+    }
+    selected_matches = {
+        (x.page_slug, x.line_num): x for x in all_matches if x.form_key in selected_keys
+    }
+
+    num_replacements = 0
+    num_pages_changed = 0
     for page_ in project_.pages:
         if not page_.revisions:
             continue
 
+        buf = []
         latest = page_.revisions[-1]
-        matches = []
         for line_num, line in enumerate(latest.content.splitlines()):
+            key = (page_.slug, line_num)
+            try:
+                match = selected_matches[key]
+                buf.append(match.result)
+                num_replacements += 1
+            except KeyError:
+                buf.append(line)
+                continue
 
-            form_key = f"match{page_.slug}-{line_num}"
-            replace_form_key = f"match{page_.slug}-{line_num}-replace"
+        new_content = "\n".join(buf)
+        if new_content != latest.content:
+            num_pages_changed += 1
+            new_summary = f'Replaced "{query}" with "{replace}"'
+            add_revision(
+                page=page_,
+                summary=new_summary,
+                content=new_content,
+                status=page_.status.name,
+                version=page_.version,
+                author_id=current_user.id,
+            )
 
-            if selected_keys.get(form_key) == "selected":
-                LOG.debug(f"{__name__}: {form_key}: {selected_keys.get(form_key)}")
-                LOG.debug(
-                    f"{__name__}: {replace_form_key}: {request.form.get(replace_form_key)}"
-                )
-                LOG.debug(f"{__name__}: {form_key}: Appended")
-                replaced_line = query_pattern.sub(replace, line)
-                matches.append(
-                    {
-                        "query": line,
-                        "replace": replaced_line,
-                        "line_num": line_num,
-                    }
-                )
+    if num_replacements:
+        replace_text = f"{num_replacements} change"
+        if num_replacements > 1:
+            replace_text += "s"
 
-        results.append({"page": page_, "matches": matches})
-        LOG.debug(f"{__name__}: Total matches appended: {len(matches)}")
+        page_text = f"{num_pages_changed} page"
+        if num_pages_changed > 1:
+            page_text += "s"
 
-    selected_count = sum(value == "selected" for value in selected_keys.values())
-    LOG.debug(f"{__name__} > Number of selected changes = {selected_count}")
-
-    return render_template(
-        "proofing/projects/confirm_changes.html",
-        project=project_,
-        form=ConfirmChangesForm(),
-        query=query,
-        replace=replace,
-        results=results,
-    )
-
-
-@bp.route("/<slug>/submit-changes", methods=["GET", "POST"])
-@p2_required
-def submit_changes(slug):
-    """Submit selected changes across all of the project's pages.
-
-    This is useful to replace a string across the project in one shot.
-    """
-
-    project_ = q.project(slug)
-    if project_ is None:
-        abort(404)
-
-    LOG.debug(
-        f"{__name__}: SUBMIT_CHANGES --- {request.method} > {list(request.form.keys())}"
-    )
-
-    # FIXME: find a way to validate this form. Current `matches` are coming in the way of validators.
-    form = PreviewChangesForm(request.form)
-    # if not form.validate():
-    #     # elif request.form.get("form_submitted") is None:
-    #     invalid_keys = list(form.errors.keys())
-    #     LOG.debug(f'{__name__}: Invalid form values - {request.method}, invalid keys: {invalid_keys}')
-    #     return redirect(url_for("proofing.project.replace", slug=slug))
-
-    render = None
-    # search for "query" string and replace with "update" string
-    query = form.query.data
-    replace = form.replace.data
-
-    LOG.debug(
-        f"{__name__}: ({request.method})>  Got to submit method with {query}->{replace} "
-    )
-    LOG.debug(f"{__name__}: {request.method} > {list(request.form.keys())}")
-    selected_keys = {
-        key: value
-        for key, value in request.form.items()
-        if key.startswith("match") and not key.endswith("replace")
-    }
-    render = _select_changes(project_, selected_keys, query=query, replace=replace)
-
-    return render
-
-
-@bp.route("/<slug>/confirm_changes", methods=["GET", "POST"])
-@p2_required
-def confirm_changes(slug):
-    """Confirm changes to replace a string across all of the project's pages."""
-    project_ = q.project(slug)
-    if project_ is None:
-        abort(404)
-    LOG.debug(
-        f"{__name__}: confirm_changes {request.method} > Keys: {list(request.form.keys())}, Items: {list(request.form.items())}"
-    )
-    form = ConfirmChangesForm(request.form)
-    if not form.validate():
-        flash("Invalid input.", "danger")
-        invalid_keys = list(form.errors.keys())
-        LOG.error(
-            f"{__name__}: Invalid form - {request.method}, invalid keys: {invalid_keys}"
-        )
-        return redirect(url_for("proofing.project.replace", slug=slug))
-
-    if form.confirm.data:
-        LOG.debug(f"{__name__}: {request.method} > Confirmed!")
-        query = form.query.data
-        replace = form.replace.data
-
-        # Get the changes from the form and store them in a list
-        pages = {}
-
-        # Iterate over the dictionary `request.form`
-        for key, value in request.form.items():
-            # Check if key matches the pattern
-            match = re.match(r"match(\d+)-(\d+)-replace", key)
-            if match:
-                # Extract page_slug and line_num from the key
-                page_slug = match.group(1)
-                line_num = int(match.group(2))
-                if page_slug not in pages:
-                    pages[page_slug] = {}
-                pages[page_slug][line_num] = value
-
-        for page_slug, changed_lines in pages.items():
-            # Get the corresponding `Page` object
-            LOG.debug(f"{__name__}: Project - {project_.slug}, Page : {page_slug}")
-
-            # Page query needs id for project and slug for page
-            page = q.page(project_.id, page_slug)
-            if not page:
-                LOG.error(
-                    f"{__name__}: Page not found for project - {project_.slug}, page : {page_slug}"
-                )
-                return render_template(url_for("proofing.project.replace", slug=slug))
-
-            latest = page.revisions[-1]
-            current_lines = latest.content.splitlines()
-            # Iterate over the `lines` dictionary
-            for line_num, replace_value in changed_lines.items():
-                # Check if the line_num exists in the dictionary for this page
-                LOG.debug(
-                    f"{__name__}: Current - {current_lines[line_num]}, Length of lines = {len(current_lines)}"
-                )
-                if line_num < len(current_lines):
-                    # Replace the line with the replacement value
-                    current_lines[line_num] = replace_value
-                else:
-                    LOG.error(
-                        f"{__name__}: Invalid line number {line_num} in {page_slug} which has only {len(current_lines)}"
-                    )
-                    continue
-            # Join the lines into a single string
-            new_content = "\n".join(current_lines)
-            # Check if the page content has changed
-            if new_content != latest.content:
-                # Add a new revision to the page
-                new_summary = f'Replaced "{query}" with "{replace}"'
-                new_revision = add_revision(
-                    page=page,
-                    summary=new_summary,
-                    content=new_content,
-                    status=page.status.name,
-                    version=page.version,
-                    author_id=current_user.id,
-                )
-                LOG.debug(f"{__name__}: New reviion > {page_slug}: {new_revision}")
-
-        flash("Changes applied.", "success")
-        return redirect(url_for("proofing.project.activity", slug=slug))
-    elif form.cancel.data:
-        LOG.debug(f"{__name__}: confirm_changes Cancelled")
-        return redirect(url_for("proofing.project.edit", slug=slug))
-
-    return render_template(url_for("proofing.project.edit", slug=slug))
+        flash(f"Saved {replace_text} across {page_text}.", "success")
+    else:
+        flash("No changes made.", "warning")
+    return redirect(url_for("proofing.project.edit", slug=slug))
 
 
 @bp.route("/<slug>/batch-ocr", methods=["GET", "POST"])
