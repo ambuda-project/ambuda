@@ -49,17 +49,14 @@ export const Layout = {
   SideBySide: 'side-by-side',
 };
 
-export function getBlockSlug(blockID) {
-  // Slice to remove text XML id.
-  return blockID.split('.').slice(1).join('.');
-}
-
 /* Alpine code
  * ===========
  */
 
 // Dictionary key for localstorage.
 const READER_CONFIG_KEY = 'reader';
+
+const MSG_CONTENT_MISSING = '<p>Sorry, this content is not available right now.</p>';
 
 // The main application.
 export default () => ({
@@ -119,6 +116,8 @@ export default () => ({
 
   // If true, show the sidebar.
   showSidebar: false,
+  // Sidebar error message (for failed fetches)
+  sidebarErrorMessage: null,
   // Text in the dictionary search field. This field is visible only on wide
   // screens.
   dictQuery: '',
@@ -128,6 +127,9 @@ export default () => ({
   init() {
     this.loadSettings();
     this.data = JSON.parse(document.getElementById('payload').textContent);
+
+    this.replaceHistoryState();
+    window.addEventListener('popstate', this.onPopHistoryState.bind(this));
   },
 
   // Settings
@@ -179,17 +181,72 @@ export default () => ({
     return Sanscript.t(devanagariStr, Script.Devanagari, this.script);
   },
 
+  // Browser history
+  // ===============
+  // For a useful summary of the API and gotchas, see::
+  //
+  // https://blog.twitter.com/engineering/en_us/a/2012/implementing-pushstate-for-twittercom
+
+  createHistoryState(scrollTop) {
+    // `this.data` is a proxy object and cannot be cloned directly. So instead,
+    // clone it by building a new object from its JSON string.
+    const dataClone = JSON.parse(JSON.stringify(this.data));
+    return { data: dataClone, scrollTop: document.documentElement.scrollTop };
+  },
+  /**
+   * Save the history state for the current URL.
+   *
+   * Call this method just after the initial full-page load.
+   */
+  replaceHistoryState() {
+    const url = window.location.pathname;
+    const state = this.createHistoryState();
+    window.history.replaceState(state, '', url);
+  },
+
+  /**
+   * Save the history state for the current URL.
+   *
+   * Call this method to nagivate to a new reader page.
+   */
+  pushHistoryState(url) {
+    // Reset scroll position to match browser behavior.
+    document.documentElement.scrollTop = 0;
+    const state = this.createHistoryState();
+    window.history.pushState(state, '', url);
+  },
+
+  /** Handler for the `popstate` event. */
+  onPopHistoryState(e) {
+    if (!e.state) {
+      return;
+    }
+    const { data, scrollTop } = e.state;
+    this.data = data;
+
+    // FIXME: this line doesn't seem to take effect, perhaps because it runs
+    // before the content above has rendered.
+    // document.documentElement.scrollTop = scrollTop;
+  },
+
   // Ajax requests
   // =============
 
   /** Load text data from the server. */
-  async fetchBlocks() {
-    // HACK: just use the pathname.
-    const url = `/api${window.location.pathname}`;
+  async fetchSection(url) {
+    if (!url) return;
 
-    const resp = await fetch(url);
+    // HACK: just prepend "/api".
+    const apiURL = `/api${url}`;
+    const resp = await fetch(apiURL);
+
     if (resp.ok) {
+      // Replace state to retain scroll position.
+      this.replaceHistoryState();
+
       this.data = await resp.json();
+
+      this.pushHistoryState(url);
     } else {
       // Loading failed -- just use the server-side.
       // FIXME: make the non-JS experience smoother.
@@ -207,7 +264,7 @@ export default () => ({
       this.dictionaryResponse = await resp.text();
     } else {
       // FIXME: add i18n support
-      this.dictionaryResponse = '<p>Sorry, this content is not available right now.</p>';
+      this.dictionaryResponse = MSG_CONTENT_MISSING;
     }
   },
 
@@ -228,7 +285,7 @@ export default () => ({
       return [html, true];
     }
     // FIXME: add i18n support
-    const html = '<p>Sorry, this content is not available right now. (Server error)</p>';
+    const html = MSG_CONTENT_MISSING;
     return [html, false];
   },
 
@@ -323,14 +380,9 @@ export default () => ({
     if (ok) {
       block.parse = html;
       block.showParse = true;
-
-      // FIXME: move to alpine
-      const $container = $('#parse--response');
-      $container.innerHTML = '';
+      this.sidebarErrorMessage = null;
     } else {
-      // FIXME: move to alpine
-      const $container = $('#parse--response');
-      $container.innerHTML = html;
+      this.sidebarErrorMessage = html;
       this.showSidebar = true;
     }
   },

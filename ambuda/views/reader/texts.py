@@ -127,6 +127,31 @@ def text_resources(slug):
     return render_template("texts/text-resources.html", text=text)
 
 
+def _create_section_data(text_: db.Text, cur, prev, next_) -> Section:
+    # Fetch with content blocks
+    cur = q.text_section(text_.id, cur.slug)
+
+    with q.get_session() as _:
+        _ = cur.blocks
+
+    blocks = []
+    for block in cur.blocks:
+        blocks.append(
+            Block(
+                slug=block.slug,
+                mula=xml.transform_text_block(block.xml),
+            )
+        )
+
+    return Section(
+        text_title=_hk_to_dev(text_.title),
+        section_title=_hk_to_dev(cur.title),
+        blocks=blocks,
+        prev_url=_make_section_url(text_, prev),
+        next_url=_make_section_url(text_, next_),
+    )
+
+
 @bp.route("/<text_slug>/<section_slug>")
 def section(text_slug, section_slug):
     """Show a specific section of a text."""
@@ -147,29 +172,7 @@ def section(text_slug, section_slug):
             abort(404)
 
     has_no_parse = text_.slug in HAS_NO_PARSE
-
-    # Fetch with content blocks
-    cur = q.text_section(text_.id, section_slug)
-
-    with q.get_session() as _:
-        _ = cur.blocks
-
-    blocks = []
-    for block in cur.blocks:
-        blocks.append(
-            Block(
-                slug=block.slug,
-                mula=xml.transform_text_block(block.xml),
-            )
-        )
-
-    data = Section(
-        text_title=_hk_to_dev(text_.title),
-        section_title=_hk_to_dev(cur.title),
-        blocks=blocks,
-        prev_url=_make_section_url(text_, prev),
-        next_url=_make_section_url(text_, next_),
-    )
+    data = _create_section_data(text_, cur, prev, next_)
     json_payload = json.dumps(data, cls=AmbudaJSONEncoder)
 
     return render_template(
@@ -216,14 +219,5 @@ def reader_json(text_slug, section_slug):
     except ValueError:
         abort(404)
 
-    with q.get_session() as _:
-        html_blocks = [xml.transform_text_block(b.xml) for b in cur.blocks]
-
-    data = Section(
-        text_title=_hk_to_dev(text_.title),
-        section_title=_hk_to_dev(cur.title),
-        blocks=html_blocks,
-        prev_url=_make_section_url(text, prev),
-        next_url=_make_section_url(text, next_),
-    )
+    data = _create_section_data(text_, cur, prev, next_)
     return jsonify(data)
